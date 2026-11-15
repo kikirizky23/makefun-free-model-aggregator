@@ -1,259 +1,438 @@
-// brief.ts — read the trial brief (MAKEFUN_PROMPT_FILE) and expose its
-// directory, the sealed quality table, and the workload manifest.
+// lib/brief.ts — Pembaca brief free-model-aggregator-01 (v2).
 //
-// The brief is prose: JSON documents are embedded in it as fenced blocks.
-// Each document carries a `schema` field that names it. The three documents
-// we need are the directory (providers + auth + base URL + key env),
-// the ratings table (rating + capabilities per provider/model), and the
-// workload (the 20 requests with their requirements, weights and wires).
+// Tugas file ini: mengubah teks mentah MAKEFUN_PROMPT_FILE menjadi sebuah
+// Brief yang terstruktur (daftar provider, tabel rating, manifest workload,
+// dan tabel budget). File ini TIDAK tahu apa-apa soal HTTP, provider,
+// maupun pemilihan model: ia hanya mem-parsing dokumen.
+//
+// Tabel budget v2 adalah RANGE [minimum, maksimum] per provider, hardcode
+// dari spesifikasi kontes (bukan dari brief, karena brief tidak memuat
+// angka budget). Rentang ini dipakai router untuk merencanakan alokasi
+// panggilan sepanjang trial; angka pastinya tetap tidak dipublikasikan
+// oleh env, jadi range di sini adalah perkiraan aman dari kit.
+//
+// Deterministik: tidak ada Date.now(), Math.random(), atau wall clock.
+// Semua fungsi di sini murni: input sama -> output sama.
+
 import { readFileSync } from "node:fs";
 
+// ---------------------------------------------------------------------------
+// Tipe yang diekspor
+// ---------------------------------------------------------------------------
+
+/** Wire yang dipakai sebuah provider untuk berbicara dengan modelnya. */
 export type Wire = "openai" | "anthropic" | "gemini";
+
+/** Skema auth sebuah provider: nama header yang membawa key-nya. */
 export type AuthScheme = "bearer" | "x-api-key" | "x-goog-api-key" | "none";
 
+/** Satu entri direktori provider dari dokumen providers. */
 export interface ProviderEntry {
+  /** Id provider, mis. "groq". */
   id: string;
+  /** Nama tampilan, mis. "Groq". */
   name: string;
+  /** Wire vendor yang dipakai provider ini. */
   wire: Wire;
+  /** Skema auth provider ini (bukan wire klien). */
   auth: AuthScheme;
-  /** Directory path under the env, e.g. "/p/openrouter". */
+  /** Path direktori provider di env, mis. "/p/groq". */
   path: string;
+  /** Nama variabel env key-nya, mis. "GROQ_API_KEY" ("" bila auth none). */
   keyEnv: string;
+  /** Key provider (key simulasi di trial, key asli di layanan nyata). */
   key: string;
 }
 
+/** Satu baris tabel rating (otoritas soal model gratis dan kemampuan). */
 export interface RatingRow {
+  /** Id model, mis. "z-ai/glm-5.3-flash:free". */
   model: string;
+  /** Id provider pemilik model ini. */
   provider: string;
-  /** Rating in milli-points, e.g. 1475. */
+  /** Rating kualitas dalam milli (1475 berarti 1.475). */
   ratingMilli: number;
-  contextLength: number;
+  /** Panjang konteks dalam token, atau null bila tidak diketahui. */
+  contextLength: number | null;
+  /** Model menerima pemanggilan tools. */
   tools: boolean;
+  /** Model menerima gambar. */
   vision: boolean;
+  /** Model menerima mode JSON. */
   json: boolean;
+  /** Model gratis (otoritas: tabel rating, bukan katalog provider). */
   free: boolean;
 }
 
+/** Syarat yang harus dipenuhi model untuk melayani satu request. */
 export interface Requirements {
   tools?: boolean;
   vision?: boolean;
   json?: boolean;
+  /** Panjang konteks minimum dalam token. */
   minContext?: number;
 }
 
+/** Satu entri manifest workload. */
 export interface WorkloadRequest {
+  /** Id request, "r01".."r20" berurutan. */
   id: string;
+  /** API klien yang dipakai request ini. */
   api: "openai" | "anthropic";
+  /** Benar bila klien meminta jawaban streaming (SSE). */
   stream: boolean;
+  /** Bobot skor request ini (1 atau 2). */
   weight: number;
+  /** Syarat kemampuan model untuk request ini. */
   requires: Requirements;
 }
 
-export interface Brief {
-  providers: ProviderEntry[];
-  ratings: RatingRow[];
-  manifest: WorkloadRequest[];
-  /** Sealed per-provider trial budget range [min, max] (from the kit). */
-  budgetMax: Record<string, number>;
+/** Rating terbaik per request menurut dokumen ratings ("best"). */
+export interface BestEntry {
+  id: string;
+  ratingMilli: number;
 }
 
+/** Brief lengkap hasil parse: semua yang router dan main butuhkan. */
+export interface Brief {
+  /** Direktori provider (10 entri). */
+  providers: ProviderEntry[];
+  /** Tabel rating model gratis. */
+  ratings: RatingRow[];
+  /** Manifest workload (20 entri). */
+  manifest: WorkloadRequest[];
+  /** Rating terbaik per request (batas kolom quality). */
+  best: BestEntry[];
+  /** Tabel budget: range [min, max] panggilan per provider. */
+  budget: Record<string, [number, number]>;
+}
+
+// ---------------------------------------------------------------------------
+// Tabel budget v2: range [minimum, maksimum] panggilan per provider.
+// ---------------------------------------------------------------------------
+
+/** Range budget per provider, hardcode dari spesifikasi v2. */
+export const BUDGET_RANGES: Record<string, [number, number]> = {
+  groq: [9, 12],
+  cerebras: [5, 6],
+  gemini: [6, 8],
+  zai: [4, 5],
+  openrouter: [10, 12],
+  sambanova: [4, 5],
+  pollinations: [10, 14],
+  cloudflare: [7, 8],
+  ovh: [5, 6],
+  kilol: [12, 16],
+};
+
+/** Default aman untuk provider yang tidak dikenal: range paling longgar. */
+export const DEFAULT_BUDGET_RANGE: [number, number] = [4, 16];
+
+/**
+ * Range budget [min, max] untuk satu provider.
+ * Id tak dikenal -> default aman [4, 16]. Selalu mengembalikan pasangan
+ * baru, jadi pemanggil bebas mengubahnya tanpa merusak tabel.
+ */
+export function budgetRange(providerId: string): [number, number] {
+  const found = BUDGET_RANGES[providerId];
+  if (found === undefined) return [DEFAULT_BUDGET_RANGE[0], DEFAULT_BUDGET_RANGE[1]];
+  return [found[0], found[1]];
+}
+
+/** Brief kosong: dipakai bila tidak ada brief / file tak terbaca. */
 export const EMPTY_BRIEF: Brief = {
   providers: [],
   ratings: [],
   manifest: [],
-  budgetMax: {},
+  best: [],
+  budget: { ...BUDGET_RANGES },
 };
 
-/** Sealed budget range ceilings, per provider id, from the kit's table. */
-const BUDGET_MAX: Record<string, number> = {
-  groq: 12,
-  cerebras: 6,
-  gemini: 8,
-  zai: 5,
-  openrouter: 12,
-  sambanova: 5,
-  pollinations: 14,
-  cloudflare: 8,
-  ovh: 6,
-  kilol: 16,
-};
+// ---------------------------------------------------------------------------
+// Util parsing kecil (toleran: field hilang diberi default)
+// ---------------------------------------------------------------------------
 
-/** Scan text for JSON objects, returning each parsed object with a schema. */
-function scanJsonDocs(text: string): Record<string, unknown>[] {
-  const docs: Record<string, unknown>[] = [];
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function asBoolean(value: unknown, fallback = false): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function asNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function asWire(value: unknown): Wire {
+  if (value === "anthropic" || value === "gemini") return value;
+  return "openai";
+}
+
+function asAuth(value: unknown): AuthScheme {
+  const raw = typeof value === "string" ? value.toLowerCase().replace(/_/g, "-") : "";
+  if (raw === "x-api-key") return "x-api-key";
+  if (raw === "x-goog-api-key") return "x-goog-api-key";
+  if (raw === "none" || raw === "") return "none";
+  return "bearer";
+}
+
+function asApi(value: unknown): "openai" | "anthropic" {
+  return value === "anthropic" ? "anthropic" : "openai";
+}
+
+/**
+ * Pindai teks mentah dan ekstrak semua objek JSON berimbang.
+ * Penyeimbang kurung sadar string dan escape, jadi kurung di dalam
+ * string JSON (mis. di dalam teks request) tidak mengacaukan hitungan.
+ * Objek yang gagal di-JSON.parse dilewati diam-diam.
+ */
+function extractJsonObjects(text: string): unknown[] {
+  const found: unknown[] = [];
   let i = 0;
   while (i < text.length) {
-    const open = text.indexOf("{", i);
-    if (open < 0) break;
+    const start = text.indexOf("{", i);
+    if (start === -1) break;
     let depth = 0;
-    let inStr = false;
-    let esc = false;
-    let j = open;
-    for (; j < text.length; j += 1) {
+    let inString = false;
+    let escaped = false;
+    let j = start;
+    let closed = false;
+    for (; j < text.length; j++) {
       const ch = text[j];
-      if (inStr) {
-        if (esc) esc = false;
-        else if (ch === "\\") esc = true;
-        else if (ch === '"') inStr = false;
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
         continue;
       }
-      if (ch === '"') inStr = true;
-      else if (ch === "{") depth += 1;
-      else if (ch === "}") {
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === "{") {
+        depth += 1;
+      } else if (ch === "}") {
         depth -= 1;
-        if (depth === 0) break;
-      }
-    }
-    if (depth === 0 && j < text.length) {
-      try {
-        const parsed: unknown = JSON.parse(text.slice(open, j + 1));
-        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-          docs.push(parsed as Record<string, unknown>);
+        if (depth === 0) {
+          closed = true;
+          break;
         }
-      } catch {
-        // Not JSON — keep scanning past the opening brace.
       }
-      i = j + 1;
-    } else {
-      i = open + 1;
     }
+    if (!closed) break;
+    try {
+      found.push(JSON.parse(text.slice(start, j + 1)));
+    } catch {
+      // Dokumen rusak: lewati, lanjut memindai setelah objek ini.
+    }
+    i = j + 1;
   }
-  return docs;
+  return found;
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
+function parseProviders(doc: Record<string, unknown>): ProviderEntry[] {
+  if (!Array.isArray(doc.providers)) return [];
+  const out: ProviderEntry[] = [];
+  // Guard: id provider ganda (dokumen cacat / gabungan dua direktori) —
+  // entri pertama menang, sisanya dibuang supaya satu provider tidak
+  // muncul dua kali di katalog dan dihitung dua kali oleh router.
+  const seen = new Set<string>();
+  for (const raw of doc.providers) {
+    if (!isRecord(raw)) continue;
+    const id = asString(raw.id);
+    if (id === "" || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      name: asString(raw.name, id),
+      wire: asWire(raw.wire),
+      auth: asAuth(raw.auth),
+      // Direktori provider; terima juga base_url bila dokumen memakainya.
+      path: asString(raw.path, asString(raw.base_url)),
+      keyEnv: asString(raw.key_env, asString(raw.keyEnv)),
+      key: asString(raw.key),
+    });
+  }
+  return out;
 }
 
-function str(v: unknown, fallback = ""): string {
-  return typeof v === "string" ? v : fallback;
+function parseRatings(doc: Record<string, unknown>): RatingRow[] {
+  if (!Array.isArray(doc.ratings)) return [];
+  const out: RatingRow[] = [];
+  // Guard sepasang parseProviders: pasangan (provider, model) ganda —
+  // baris pertama menang, supaya ratingRow() deterministik dan satu
+  // model tidak punya dua rating yang saling bertentangan.
+  const seen = new Set<string>();
+  for (const raw of doc.ratings) {
+    if (!isRecord(raw)) continue;
+    const model = asString(raw.model);
+    const provider = asString(raw.provider);
+    if (model === "" || provider === "") continue;
+    const key = `${provider}|${model}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const contextRaw = raw.context_length !== undefined ? raw.context_length : raw.contextLength;
+    out.push({
+      model,
+      provider,
+      ratingMilli: asNumber(raw.rating_milli !== undefined ? raw.rating_milli : raw.ratingMilli, 0),
+      contextLength:
+        typeof contextRaw === "number" && Number.isFinite(contextRaw) ? contextRaw : null,
+      tools: asBoolean(raw.tools),
+      vision: asBoolean(raw.vision),
+      json: asBoolean(raw.json),
+      // Dokumen ratings berisi model gratis saja; flag yang hilang berarti
+      // gratis, hanya "free": false yang eksplisit yang membuatnya berbayar.
+      free: raw.free === undefined ? true : asBoolean(raw.free, true),
+    });
+  }
+  return out;
 }
 
-function num(v: unknown, fallback = 0): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+function parseBest(doc: Record<string, unknown>): BestEntry[] {
+  if (!Array.isArray(doc.best)) return [];
+  const out: BestEntry[] = [];
+  for (const raw of doc.best) {
+    if (!isRecord(raw)) continue;
+    const id = asString(raw.id);
+    if (id === "") continue;
+    out.push({
+      id,
+      ratingMilli: asNumber(raw.rating_milli !== undefined ? raw.rating_milli : raw.ratingMilli, 0),
+    });
+  }
+  return out;
 }
 
-function bool(v: unknown, fallback = false): boolean {
-  return typeof v === "boolean" ? v : fallback;
+function parseManifest(doc: Record<string, unknown>): WorkloadRequest[] {
+  if (!Array.isArray(doc.manifest)) return [];
+  const out: WorkloadRequest[] = [];
+  for (const raw of doc.manifest) {
+    if (!isRecord(raw)) continue;
+    const id = asString(raw.id);
+    if (id === "") continue;
+    const reqRaw = isRecord(raw.requires) ? raw.requires : {};
+    const requires: Requirements = {};
+    if (asBoolean(reqRaw.tools)) requires.tools = true;
+    if (asBoolean(reqRaw.vision)) requires.vision = true;
+    if (asBoolean(reqRaw.json)) requires.json = true;
+    const minRaw = reqRaw.min_context !== undefined ? reqRaw.min_context : reqRaw.minContext;
+    if (typeof minRaw === "number" && Number.isFinite(minRaw)) requires.minContext = minRaw;
+    out.push({
+      id,
+      api: asApi(raw.api),
+      stream: asBoolean(raw.stream),
+      weight: asNumber(raw.weight, 1),
+      requires,
+    });
+  }
+  return out;
 }
 
-/** Parse the brief text into a Brief. Throws on unreadable documents. */
+// ---------------------------------------------------------------------------
+// Fungsi yang diekspor
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse teks brief mentah menjadi Brief.
+ *
+ * Mengenali ketiga dokumen dari field schema-nya, masing-masing dalam dua
+ * varian nama skema (mis. ".../providers/v1" dan ".../providers/v2"):
+ * direktori provider, tabel rating, dan manifest workload. Klasifikasi
+ * mengandalkan isi dokumen (array providers / ratings / manifest), jadi
+ * varian skema baru atau dokumen tanpa schema tetap dikenali selama
+ * field-fieldnya ada. Dokumen yang gagal parse dilewati; field yang
+ * hilang diberi default (lihat parser di atas).
+ */
 export function parseBrief(text: string): Brief {
-  const docs = scanJsonDocs(text);
   const brief: Brief = {
     providers: [],
     ratings: [],
     manifest: [],
-    budgetMax: { ...BUDGET_MAX },
+    best: [],
+    budget: { ...BUDGET_RANGES },
   };
-  for (const doc of docs) {
-    const schema = str(doc.schema);
-    const isDirectory =
-      schema === "free-model-aggregator-01/providers/v1" ||
-      schema === "agent-fun/provider-directory/v1";
-    const isRatings =
-      schema === "free-model-aggregator-01/ratings/v1" ||
-      schema === "agent-fun/rating/v1";
-    const isWorkload =
-      schema === "free-model-aggregator-01/workload/v1" ||
-      schema === "agent-fun/workload/v1";
-    if (isDirectory && Array.isArray(doc.providers)) {
-      for (const raw of doc.providers) {
-        if (!isRecord(raw)) continue;
-        brief.providers.push({
-          id: str(raw.id),
-          name: str(raw.name),
-          wire: (str(raw.wire, "openai") as Wire) || "openai",
-          auth: (str(raw.auth, "none") as AuthScheme) || "none",
-          // The directory names the field `path` (e.g. "/p/groq"); the
-          // catalog reports it verbatim as base_url, never joined to the env.
-          path: str(raw.path) || str(raw.base_url),
-          keyEnv: str(raw.key_env),
-          key: str(raw.key),
-        });
-      }
-    } else if (isRatings && Array.isArray(doc.ratings)) {
-      for (const raw of doc.ratings) {
-        if (!isRecord(raw)) continue;
-        brief.ratings.push({
-          model: str(raw.model),
-          provider: str(raw.provider),
-          ratingMilli: num(raw.rating_milli),
-          contextLength: num(raw.context_length),
-          tools: bool(raw.tools),
-          vision: bool(raw.vision),
-          json: bool(raw.json),
-          free: bool(raw.free, true),
-        });
-      }
-    } else if (isRatings && Array.isArray(doc.models)) {
-      // Alternate key for the same table.
-      for (const raw of doc.models) {
-        if (!isRecord(raw)) continue;
-        brief.ratings.push({
-          model: str(raw.model),
-          provider: str(raw.provider),
-          ratingMilli: num(raw.rating_milli),
-          contextLength: num(raw.context_length),
-          tools: bool(raw.tools),
-          vision: bool(raw.vision),
-          json: bool(raw.json),
-          free: bool(raw.free, true),
-        });
-      }
-    } else if (isWorkload && Array.isArray(doc.manifest)) {
-      for (const raw of doc.manifest) {
-        if (!isRecord(raw)) continue;
-        const req = isRecord(raw.requires) ? raw.requires : {};
-        brief.manifest.push({
-          id: str(raw.id),
-          api: str(raw.api, "openai") as "openai" | "anthropic",
-          stream: bool(raw.stream),
-          weight: num(raw.weight, 1),
-          requires: {
-            tools: bool(req.tools) || undefined,
-            vision: bool(req.vision) || undefined,
-            json: bool(req.json) || undefined,
-            minContext: num(req.min_context) || undefined,
-          },
-        });
-      }
+  if (typeof text !== "string" || text === "") return brief;
+  for (const doc of extractJsonObjects(text)) {
+    if (!isRecord(doc)) continue;
+    const schema = asString(doc.schema);
+    // Varian skema dikenali lewat kata kuncinya; klasifikasi akhir tetap
+    // memakai keberadaan array-nya, supaya dokumen tanpa schema pun lolos.
+    const isProvidersDoc = schema.includes("providers") || Array.isArray(doc.providers);
+    const isRatingsDoc = schema.includes("ratings") || Array.isArray(doc.ratings);
+    const isWorkloadDoc = schema.includes("workload") || Array.isArray(doc.manifest);
+    if (isProvidersDoc && brief.providers.length === 0) {
+      brief.providers = parseProviders(doc);
+    }
+    if (isRatingsDoc && brief.ratings.length === 0) {
+      brief.ratings = parseRatings(doc);
+      brief.best = parseBest(doc);
+    }
+    if (isWorkloadDoc && brief.manifest.length === 0) {
+      brief.manifest = parseManifest(doc);
     }
   }
   return brief;
 }
 
-/** Read and parse the brief file; returns EMPTY_BRIEF when absent. */
-export function readBriefFile(path: string | undefined): Brief {
-  if (!path) return EMPTY_BRIEF;
+/**
+ * Baca file brief dari path dan parse. Bila path tak ada, tak terbaca,
+ * atau isinya bukan teks yang bisa di-parse, kembalikan brief kosong
+ * (bukan throw) — pemanggil tetap bisa jalan dengan katalog kosong.
+ */
+export function readBriefFile(path: string): Brief {
   try {
     const text = readFileSync(path, "utf8");
     return parseBrief(text);
   } catch {
-    return EMPTY_BRIEF;
+    return {
+      providers: [],
+      ratings: [],
+      manifest: [],
+      best: [],
+      budget: { ...BUDGET_RANGES },
+    };
   }
 }
 
-/** The rating row for a provider/model pair, or undefined. */
+/** Baris rating untuk satu (provider, model); undefined bila tak ada. */
 export function ratingRow(
   brief: Brief,
-  providerId: string,
-  modelId: string,
+  provider: string,
+  model: string,
 ): RatingRow | undefined {
-  return brief.ratings.find((r) => r.provider === providerId && r.model === modelId);
+  return brief.ratings.find((row) => row.provider === provider && row.model === model);
 }
 
-/** Whether a model row meets the request's requirements. */
-export function meetsRequirements(row: RatingRow, req: Requirements): boolean {
-  if (req.tools && !row.tools) return false;
-  if (req.vision && !row.vision) return false;
-  if (req.json && !row.json) return false;
-  if (req.minContext !== undefined && row.contextLength < req.minContext) return false;
+/**
+ * Benar bila baris rating memenuhi semua syarat request.
+ * Syarat yang tidak diminta (undefined/false) tidak membatasi.
+ * minContext gagal bila context length tak diketahui (null).
+ */
+export function meetsRequirements(row: RatingRow | undefined, req: Requirements): boolean {
+  if (row === undefined) return false;
+  if (req.tools === true && row.tools !== true) return false;
+  if (req.vision === true && row.vision !== true) return false;
+  if (req.json === true && row.json !== true) return false;
+  if (req.minContext !== undefined) {
+    if (row.contextLength === null || row.contextLength < req.minContext) return false;
+  }
   return true;
 }
 
-/** Whether the provider's model is free (ratings table is the authority). */
-export function isFreeModel(brief: Brief, providerId: string, modelId: string): boolean {
-  const row = ratingRow(brief, providerId, modelId);
-  return row !== undefined ? row.free : false;
+/**
+ * Benar bila (provider, model) gratis. Tabel rating adalah otoritas soal
+ * gratis: model tanpa baris rating, atau barisnya bertanda free false,
+ * dianggap TIDAK gratis dan tidak pernah boleh melayani request.
+ */
+export function isFreeModel(brief: Brief, provider: string, model: string): boolean {
+  const row = ratingRow(brief, provider, model);
+  return row !== undefined && row.free === true;
 }
